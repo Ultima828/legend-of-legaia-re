@@ -1,196 +1,605 @@
-name: Build Android APK
+---
+# CI + GitHub Pages deploy for legend-of-legaia-re.
+# Modeled on faultline/.github/workflows/main-ci.yml (same self-hosted runner
+# convention). Tailored:
+#   - Pull requests run the disc-free gates (`gates`) and `pr-lint` (fmt,
+#     clippy, wasm32 type-check, then the disc-free test suite) on every
+#     push to the PR, so a red test stops a merge instead of breaking main.
+#     The release builds (`ci`) stay on push-to-main and workflow_dispatch.
+#     The deploy-pages job packages both wasm bundles with `scripts/ci/build-wasm.sh`.
+#   - No scenarios symlink to materialize.
+#   - cargo runs directly on the runner (no docker-compose `rust-ci` service
+#     in this repo yet; the only compose service here is `ghidra`).
+#   - Validation suite is gated on LEGAIA_DISC_BIN, which is intentionally
+#     not provided in the main `ci` job: this repo ships no game data. The
+#     gated tests print a skip notice and pass.
+#   - A separate `disc-test` job runs the full disc-gated suite. It fires
+#     on: (a) manual workflow_dispatch, or (b) a PR that has the `disc-test`
+#     label added. Set the `LEGAIA_DISC_BIN` repository variable (Settings >
+#     Variables > Actions) to the disc image path on the self-hosted runner.
+#     disc-nightly.yml runs the same suite on a schedule, so it runs whether
+#     or not anyone asks for it.
+#   - Tag pushes are NOT handled here. release.yml owns the `v*` tag event
+#     and re-runs these same fmt/clippy/test gates as its own `verify` job,
+#     so a release stays test-gated without two workflows contending for the
+#     single self-hosted runner on one commit. See docs/tooling/releases.md.
+
+name: Main CI
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    # opened / synchronize / reopened drive `gates` + `pr-lint`; `labeled`
+    # is reserved for the `disc-test` job and runs nothing else.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      pages_only:
+        # release.yml dispatches this once a release publishes, so the site's
+        # play bundle is rebuilt with the release's version baked in (its
+        # netplay rooms then admit that release's desktop builds).
+        description: 'Redeploy the site only: skip the CI build and the disc tests.'
+        required: false
+        default: false
+        type: boolean
 
-permissions:
-  contents: read
+# A PR push supersedes the previous push's lint run, so PR runs cancel per
+# PR; a label event gets its own group so adding `disc-test` never cancels
+# the lint pass. Pushes to main keep one group per commit and never cancel.
+concurrency:
+  group: main-ci-${{ github.event_name == 'pull_request' && format('pr-{0}-{1}', github.event.pull_request.number, github.event.action == 'labeled' && 'label' || 'push') || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'labeled' }}
+
+# Every cargo step builds into one persistent target directory OUTSIDE the
+# checkout. `actions/checkout` with `clean: true` runs `git clean -ffdx`, and
+# `-x` deletes the gitignored `target/`, so each run used to start with a cold
+# cargo fingerprint cache and recompile the whole workspace. sccache cannot
+# absorb that: it hashes the checkout path (cargo's `-C metadata` and
+# `CARGO_MANIFEST_DIR` embed it), so every workspace crate misses across the
+# runner's path and a developer's, and it never caches bins, test harnesses
+# or clippy at all (`crate-type` / `multiple input files` in its stats). Only
+# cargo's own fingerprints, kept across runs, make a run rebuild just what
+# changed. One directory for all jobs on the single self-hosted runner; the
+# concurrency group above already serialises runs per commit, and cargo's
+# build lock serialises the rest. Each cargo job narrows this root to a
+# per-toolchain subdirectory first (scripts/ci/select-ci-target-dir.sh).
+env:
+  CARGO_TARGET_DIR: /home/mikunpc/.cache/legaia-ci-target
 
 jobs:
-  build-apk:
-    runs-on: ubuntu-latest
+  # -- Repository Gates -------------------------------------------------------
+  # The scripts/ci/check-*.py gates used to run ONLY from
+  # scripts/git-hooks/pre-commit. A gate that lives only in a hook is one
+  # `LEGAIA_SKIP_PRECOMMIT=1`, or one clone that never ran
+  # scripts/ci/install-hooks.sh, away from being fiction - and neither leaves a
+  # trace in the repository. Running them here is what makes the pre-commit
+  # hook a fast local mirror of CI rather than the only place they exist.
+  #
+  # Every gate in this job is disc-independent by construction: they read the
+  # repo's own sources, docs and site fragments. That matters because this job
+  # deliberately does NOT get LEGAIA_DISC_BIN, and because `extracted/` is
+  # gitignored and absent on the runner even when the disc is present.
+  #
+  # Separate job, not a step of `ci`: these take seconds, so a doc-link typo
+  # should report in seconds rather than behind a 40-minute clippy+test pass,
+  # and a red gate here must not read as a broken build.
+  gates:
+    name: Repo Gates
+    runs-on: self-hosted
+    # The gates take seconds; the headroom is for a cold cargo-deny install
+    # (the dependency-advisories step), which builds it once per runner.
+    timeout-minutes: 25
+    if: github.event_name != 'pull_request' || github.event.action != 'labeled'
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-java@v4
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          distribution: temurin
-          java-version: '17'
+          fetch-depth: 1
+          clean: true
 
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.10.2'
+      # Each gate self-tests its own detectors and refuses to report a pass
+      # when a control fails, so `--selftest` is not run separately here.
+      - name: Doc legibility density
+        run: python3 scripts/ci/check-doc-density.py
 
-      - name: Create Android WebView project
-        shell: bash
+      - name: Doc links + heading anchors
+        run: python3 scripts/ci/check-md-links.py
+
+      - name: Site internal links
+        run: python3 scripts/ci/check-site-links.py
+
+      # A @media block adds no specificity, so a breakpoint placed above the
+      # rule it overrides is dead code that still reads like a feature. That is
+      # how the mobile icon rail shipped never hiding, with the content column
+      # laid out full-width underneath it.
+      - name: CSS cascade order
+        run: python3 scripts/ci/check-css-cascade-order.py
+
+      # `.toLowerCase()` binds to the operand it is written on, so folding the
+      # last literal of a `+` chain leaves every earlier one cased - while the
+      # expression still reads as "this is lowercase". The texture filter's
+      # search vocabulary shipped half-folded that way, and a disc-cased word
+      # like "Ra-Seru" was unsearchable with the whole suite green.
+      - name: JS split case folds
+        run: python3 scripts/ci/check-js-case-fold-chains.py
+
+      # `import.meta` (or a static import/export declaration) inside a script
+      # loaded WITHOUT type="module" is a parse error for the whole file -
+      # nothing in it runs and only a browser ever notices. The world-overview
+      # viewer shipped dead that way.
+      - name: JS module syntax in classic scripts
+        run: python3 scripts/ci/check-js-classic-module-syntax.py
+
+      # A private copy of a helper site/js/site-util.js already shares
+      # (escaper, RGBA canvas, download, minigame poser) - copies drift.
+      - name: Site shared helpers
+        run: python3 scripts/ci/check-site-shared-helpers.py
+
+      # The play page's renderer keeps a set value until the next call, and
+      # the page draws field, battle and minigame frames through one renderer,
+      # so frame state staged inside one draw branch leaks into the others.
+      - name: Play page sticky frame state
+        run: python3 scripts/ci/check-js-sticky-frame-state.py
+
+      # The play page's scene writes log2(w) depth; a depth-tested fragment
+      # shader that keeps the rasterised depth fails the test against it.
+      - name: Play page fragment depth space
+        run: python3 scripts/ci/check-js-depth-space.py
+
+      # A hand-written `site/_content/` mirror of a docs page drifts silently:
+      # it keeps building and keeps passing the link checker while whole areas
+      # of its source stop appearing on the public site. The three register
+      # pages are rendered from docs/ at build time instead (site/_registers.py);
+      # the gate checks their markers, their expanded coverage, and the
+      # freshness stamp of any local build.
+      - name: Site mirrors cover their docs sources
+        run: python3 scripts/ci/check-site-doc-mirrors.py
+
+      - name: Shell observer traps
+        run: python3 scripts/ci/check-shell-observer-traps.py
+
+      # Each crate's tests/*.rs build as one `integration` binary, so a file
+      # its tests/integration.rs does not declare never compiles or runs.
+      - name: Integration-test declarations
+        run: python3 scripts/ci/check-integration-tests.py
+
+      # The edges among the engine's kernel crates are a committed table
+      # (scripts/ci/crate-layering.toml); a Cargo.toml that departs from it
+      # in either direction fails.
+      - name: Crate layering
+        run: python3 scripts/ci/check-crate-layering.py
+
+      # Cargo.lock against the RustSec advisory database, configured by
+      # deny.toml (docs/tooling/dependency-policy.md). cargo-deny is built
+      # from crates.io at an exact version with its own lockfile; the install
+      # runs only when the runner's copy is missing or a different version,
+      # so a warm runner spends seconds here and a cold one one build.
+      - name: Dependency advisories
+        env:
+          CARGO_DENY_VERSION: 0.20.2
         run: |
-          mkdir -p android-wrapper/app/src/main/java/com/ultima828/legaia
+          if [ "$(cargo deny --version 2>/dev/null)" != "cargo-deny $CARGO_DENY_VERSION" ]; then
+            cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
+          fi
+          cargo deny check advisories
 
-          cat > android-wrapper/settings.gradle <<'EOF'
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
-          rootProject.name = "LegaiaAndroid"
-          include ':app'
-          EOF
+      # The site's crate map, the README's crate diagrams and its layer list
+      # are generated from the manifests; a stale copy fails.
+      - name: Crate map freshness
+        run: python3 scripts/ci/gen-crate-map.py --check
 
-          cat > android-wrapper/build.gradle <<'EOF'
-          plugins {
-              id 'com.android.application' version '8.7.3' apply false
-          }
-          EOF
+      # A ratchet's baseline is edited in the same commit as the code that
+      # moved it, and the corpus ratchets below skip on this runner. This one
+      # needs only the baseline files: a value that moved the wrong way against
+      # the base revision fails without a scripts/ci/baseline-loosenings.toml
+      # entry. A pull request checks out its merge commit, so the PR base is
+      # the right comparison; a push compares against the commit it replaced.
+      - name: Baseline loosening
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 scripts/ci/check-baseline-loosening.py --self-test
+          python3 scripts/ci/film-cues.py --self-test
+          python3 scripts/ci/film-images.py --self-test
+          python3 scripts/ci/walk-film-rand.py --self-test
+          if [[ -n "${BASE_SHA}" && ! "${BASE_SHA}" =~ ^0+$ ]]; then
+            git fetch --quiet --depth=1 origin "${BASE_SHA}"
+            python3 scripts/ci/check-baseline-loosening.py --base "${BASE_SHA}"
+          else
+            echo "no base revision for this event; self-test only"
+          fi
 
-          cat > android-wrapper/app/build.gradle <<'EOF'
-          plugins {
-              id 'com.android.application'
-          }
+      # full-gate.py reads this file's run lines by indentation; a step written
+      # in a shape it cannot read, or one that blesses or pushes, fails here.
+      - name: Full gate reads this workflow
+        run: python3 scripts/ci/full-gate.py --selftest
 
-          android {
-              namespace 'com.ultima828.legaia'
-              compileSdk 35
+      - name: UI host drift
+        run: python3 scripts/ci/check-ui-host-drift.py
 
-              defaultConfig {
-                  applicationId 'com.ultima828.legaia'
-                  minSdk 23
-                  targetSdk 35
-                  versionCode 1
-                  versionName '1.0'
-              }
-          }
-          EOF
+      - name: Play-page export reach
+        run: python3 scripts/ci/check-page-export-reach.py
 
-          cat > android-wrapper/app/src/main/AndroidManifest.xml <<'EOF'
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.INTERNET"/>
-              <application
-                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
-                  android:label="Legend of Legaia"
-                  android:usesCleartextTraffic="false">
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true"
-                      android:configChanges="orientation|screenSize|keyboardHidden">
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN"/>
-                          <category android:name="android.intent.category.LAUNCHER"/>
-                      </intent-filter>
-                  </activity>
-              </application>
-          </manifest>
-          EOF
+      - name: Trait-override symmetry
+        run: python3 scripts/ci/check-trait-override-symmetry.py
 
-          cat > android-wrapper/app/src/main/java/com/ultima828/legaia/MainActivity.java <<'EOF'
-          package com.ultima828.legaia;
+      # Hand-editing the generated register files is a build error, so the
+      # drift check belongs wherever the generated files can be committed. The
+      # hook runs it only when the staged set touches scripts/vrc-diorama/;
+      # here it is unconditional, because a checkout has no staging area to
+      # condition on and the check costs milliseconds.
+      - name: VRChat-diorama register codegen drift
+        run: python3 scripts/vrc-diorama/codegen.py --check
 
-          import android.app.Activity;
-          import android.os.Bundle;
-          import android.content.Intent;
-          import android.net.Uri;
-          import android.webkit.WebView;
-          import android.webkit.WebViewClient;
-          import android.webkit.WebChromeClient;
-          import android.webkit.ValueCallback;
-          import android.webkit.WebSettings;
+      # Disc-denominated coverage ratchet. Both its inputs are gitignored, so
+      # this step reports SKIPPED on the runner and can only fail where the
+      # bytes are - which is precisely why it must still appear here. It was
+      # hook-only, and a hard gate that exists in one hook is one
+      # LEGAIA_SKIP_PRECOMMIT=1 away from being fiction; a step that says
+      # SKIPPED is at least a step whose absence would be noticed.
+      - name: Disc coverage ratchet (skips without disc data)
+        run: python3 scripts/ci/disc-coverage.py --check
 
-          public class MainActivity extends Activity {
-              private WebView web;
-              private ValueCallback<Uri[]> fileCallback;
-              private static final int FILE_REQUEST = 1001;
+      # One level finer than the step above: that one ratchets format
+      # RECOGNITION, this one ratchets how many of an entry's BYTES a parser
+      # here consumed. Its input is a sweep CSV under target/, so it reports
+      # SKIPPED on the runner for the same reason and is listed for the same
+      # reason - a hard gate that lives in one hook is one skip flag away from
+      # being fiction.
+      - name: Byte-accounting ratchet (skips without a sweep)
+        run: python3 scripts/ci/byte-account-coverage.py --check
 
-              @Override
-              public void onCreate(Bundle state) {
-                  super.onCreate(state);
-                  web = new WebView(this);
-                  WebSettings settings = web.getSettings();
-                  settings.setJavaScriptEnabled(true);
-                  settings.setDomStorageEnabled(true);
-                  settings.setMediaPlaybackRequiresUserGesture(false);
-                  settings.setAllowFileAccess(true);
-                  settings.setAllowContentAccess(true);
+      # The catalog's numbers reach the site's landing page, so a silently
+      # widening worklist is a published figure moving with nothing to say so.
+      # Its `dumped` column reads the gitignored Ghidra corpus, so this reports
+      # SKIPPED here and has teeth in the hook; it is listed for the same reason
+      # the disc-coverage ratchet is.
+      #
+      # `--live` and no `--allow-uncompared` on purpose. The step is inert here,
+      # but if the corpus ever reaches a runner this must be the invocation that
+      # compares every baselined figure - a `--check` that skips one and exits 0
+      # is what let `live/disclosure_gap` drift off its baseline of 0.
+      - name: Port-catalog ratchet (skips without the dump corpus)
+        run: python3 scripts/ci/port-catalog.py --check --live
 
-                  web.setWebViewClient(new WebViewClient());
-                  web.setWebChromeClient(new WebChromeClient() {
-                      @Override
-                      public boolean onShowFileChooser(
-                          WebView view,
-                          ValueCallback<Uri[]> callback,
-                          FileChooserParams params) {
-                          if (fileCallback != null) {
-                              fileCallback.onReceiveValue(null);
-                          }
-                          fileCallback = callback;
-                          Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                          intent.addCategory(Intent.CATEGORY_OPENABLE);
-                          intent.setType("*/*");
-                          try {
-                              startActivityForResult(intent, FILE_REQUEST);
-                          } catch (Exception e) {
-                              fileCallback = null;
-                              callback.onReceiveValue(null);
-                              return false;
-                          }
-                          return true;
-                      }
-                  });
+      # Which PORT-tagged routines a crates/retail-exec differential runs. The
+      # figure is read off the tests' `differential!` declarations, which each
+      # test checks against the routines it enters when the disc is present,
+      # so this needs neither the disc nor a build and has teeth here: a test
+      # without a declaration, a declaration this cannot resolve, or coverage
+      # below the baseline fails. See docs/tooling/retail-kernel-differential.md.
+      - name: Differential coverage ratchet
+        run: python3 scripts/ci/differential-coverage.py --check
 
-                  setContentView(web);
-                  web.loadUrl(
-                      "https://andrewaltimit.github.io/legend-of-legaia-re/play.html"
-                  );
-              }
+      # Unwaived provenance findings may not grow, and a waiver that matches no
+      # finding may not linger. It reads the gitignored dump corpus and the
+      # extracted images, so it reports SKIPPED here and has teeth in the hook
+      # and in full-gate's data pass - listed for the same reason the
+      # disc-coverage ratchet is.
+      - name: Port provenance ratchet (skips without the dump corpus)
+        run: python3 scripts/ci/check-port-provenance.py --check
 
-              @Override
-              protected void onActivityResult(
-                  int requestCode, int resultCode, Intent data) {
-                  super.onActivityResult(requestCode, resultCode, data);
-                  if (requestCode == FILE_REQUEST && fileCallback != null) {
-                      Uri[] result = null;
-                      if (resultCode == RESULT_OK && data != null
-                          && data.getData() != null) {
-                          result = new Uri[]{data.getData()};
-                      }
-                      fileCallback.onReceiveValue(result);
-                      fileCallback = null;
-                  }
-              }
+      # Every pack under packs/ validates, bundles byte-for-byte the same
+      # twice and reads back clean - what release-build.sh ships as
+      # packs/<id>.lxpack. Builds the `asset` CLI (dev profile), the one gate
+      # here that compiles, so it runs after the rest: a doc typo reports in
+      # seconds. The target dir is selected first because this job's build
+      # lands in the cache root otherwise, where the next cargo job's
+      # select-ci-target-dir.sh prunes it as stale and every run builds cold.
+      - name: Select per-toolchain target dir
+        run: scripts/ci/select-ci-target-dir.sh
 
-              @Override
-              public void onBackPressed() {
-                  if (web != null && web.canGoBack()) {
-                      web.goBack();
-                  } else {
-                      super.onBackPressed();
-                  }
-              }
+      - name: Expansion packs validate and bundle
+        run: python3 scripts/ci/check-expansion-packs.py
 
-              @Override
-              protected void onDestroy() {
-                  if (web != null) {
-                      web.destroy();
-                  }
-                  super.onDestroy();
-              }
-          }
-          EOF
+      # site/wasm/ is build output that the deploy job rebuilds, so a stale
+      # bundle on the runner is not a repository defect. Reported, never fatal.
+      - name: Shipped wasm bundle freshness (advisory)
+        run: python3 scripts/ci/check-wasm-freshness.py || true
 
-      - name: Build debug APK
-        run: gradle -p android-wrapper assembleDebug
+      # A citation of a retail address in a file that ports retail code must
+      # have a home: a `// PORT:` tag in some crate or a row in
+      # port-catalog-ignore.toml. `--scan-all`, not the hook's `--staged`: a CI
+      # checkout has an empty staging area. CI has no dump corpus, so the
+      # checker runs without its dump filter, which is the stricter reading.
+      - name: Port-tag drift
+        run: python3 scripts/ci/check-port-tags.py --scan-all --strict
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+  # -- PR Lint ----------------------------------------------------------------
+  # The cargo half of `ci` for pull requests: format, clippy, the wasm32
+  # type-check (`#[cfg(target_arch = "wasm32")]` code is invisible to every
+  # host-target pass) and the test suite. Only the release builds wait for
+  # push-to-main. The job keeps its name because branch protection keys on it.
+  pr-lint:
+    name: PR Lint
+    runs-on: self-hosted
+    # Same budget as `ci`: a cold cache after a big change can push the test
+    # build alone past half an hour on the shared runner.
+    timeout-minutes: 120
+    if: github.event_name == 'pull_request' && github.event.action != 'labeled'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          name: legaia-android-apk
-          path: android-wrapper/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 7
+          fetch-depth: 1
+          clean: true
+
+      - name: Select per-toolchain target dir
+        run: scripts/ci/select-ci-target-dir.sh
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      # The parity-oracle subcommands build only with engine-shell's
+      # default-off `oracles` feature, so the workspace pass above skips them.
+      - name: Clippy (engine-shell oracles)
+        run: cargo clippy -p legaia-engine-shell --all-targets --features oracles -- -D warnings
+
+      - name: wasm32 type-check
+        run: scripts/ci/check-wasm-target.sh
+
+      # No disc here, so every disc-gated test skips and passes; this is the
+      # disc-free suite. Last, so a format or lint failure reports first.
+      - name: Test
+        run: cargo test --workspace --profile release-test
+
+  # -- Cargo CI ---------------------------------------------------------------
+  ci:
+    name: Legaia CI
+    runs-on: self-hosted
+    # A cold sccache after a big wave can push the full build + test pass past
+    # 30 minutes on the shared runner; match the disc-test job's budget.
+    timeout-minutes: 120
+    # The full build + test pass runs on push-to-main and workflow_dispatch;
+    # pull requests get `pr-lint` (the same tests, without the release builds).
+    # A pages-only dispatch skips it: the commit it deploys already passed.
+    if: github.event_name != 'pull_request' && !inputs.pages_only
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          clean: true
+
+      # CARGO_TARGET_DIR above is the cache ROOT; this step narrows it to a
+      # per-toolchain subdirectory and prunes the rest, so a rustc bump on the
+      # runner cannot hand the new compiler the old one's rlibs (E0514 in the
+      # doctest pass). See the script header.
+      - name: Select per-toolchain target dir
+        run: scripts/ci/select-ci-target-dir.sh
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      # The parity-oracle subcommands build only with engine-shell's
+      # default-off `oracles` feature, so the workspace pass above skips them.
+      - name: Clippy (engine-shell oracles)
+        run: cargo clippy -p legaia-engine-shell --all-targets --features oracles -- -D warnings
+
+      # `release-test` is the release opt-level without thin LTO and with
+      # 16 codegen units (Cargo.toml): the test harnesses are uncacheable by
+      # sccache, so the LTO + single-codegen-unit link is paid on every run and
+      # buys a test nothing. `cargo build --release` below still exercises the
+      # shipped profile.
+      - name: Test
+        run: cargo test --workspace --profile release-test
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build both wasm bundles' crates for wasm32
+        run: cargo build --release --target wasm32-unknown-unknown -p legaia-web-viewer -p legaia-web-play-bundle
+
+  # -- Disc-Gated Test Suite --------------------------------------------------
+  disc-test:
+    name: Disc-Gated Tests
+    runs-on: self-hosted
+    timeout-minutes: 120
+    # Runs on:
+    #   (a) manual workflow_dispatch (any branch), OR
+    #   (b) a pull_request where the `disc-test` label was just added.
+    # Requires the `LEGAIA_DISC_BIN` repository variable to be set to the
+    # disc image path on the self-hosted runner (Settings > Variables > Actions).
+    if: >-
+      (github.event_name == 'workflow_dispatch' && !inputs.pages_only) ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'disc-test'))
+    env:
+      LEGAIA_DISC_BIN: ${{ vars.LEGAIA_DISC_BIN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          clean: true
+
+      # CARGO_TARGET_DIR above is the cache ROOT; this step narrows it to a
+      # per-toolchain subdirectory and prunes the rest, so a rustc bump on the
+      # runner cannot hand the new compiler the old one's rlibs (E0514 in the
+      # doctest pass). See the script header.
+      - name: Select per-toolchain target dir
+        run: scripts/ci/select-ci-target-dir.sh
+
+      # A gated test that finds no disc skips and passes, so a green run is
+      # not evidence the suite ran. The script checks the image is there, keeps
+      # every test's output, and fails on a test that skipped for want of the
+      # disc; skips on another input are counted into the job summary.
+      - name: Run disc-gated test suite
+        run: scripts/ci/run-disc-tests.sh
+
+  # -- Deploy GitHub Pages ----------------------------------------------------
+  deploy-pages:
+    name: Deploy GitHub Pages
+    needs: [ci]
+    # After a green `ci`, or on a pages-only dispatch, which skips it.
+    if: >-
+      always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' &&
+      (needs.ci.result == 'success' || (inputs.pages_only && needs.ci.result == 'skipped'))
+    runs-on: self-hosted
+    # The runner is shared, so this job's wasm-pack build competes with any
+    # other build on the box. 10 minutes was tight enough that contention
+    # alone could fail a deploy that had nothing wrong with it. The deploy
+    # attempts below (up to three 10-minute polls plus back-off) have to fit
+    # inside this too.
+    timeout-minutes: 60
+    # Two main pushes in quick succession would otherwise race two Pages
+    # deployments, and the second is refused while the first is in flight.
+    # Queue them instead; never cancel a deploy half way.
+    concurrency:
+      group: github-pages-deploy
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy1.outputs.page_url || steps.deploy2.outputs.page_url || steps.deploy3.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      # CARGO_TARGET_DIR above is the cache ROOT; this step narrows it to a
+      # per-toolchain subdirectory and prunes the rest, so a rustc bump on the
+      # runner cannot hand the new compiler the old one's rlibs (E0514 in the
+      # doctest pass). See the script header.
+      - name: Select per-toolchain target dir
+        run: scripts/ci/select-ci-target-dir.sh
+
+      - name: Install wasm-pack
+        run: |
+          # Exact version from crates.io, built from the lockfile it ships
+          # with - not the unpinned `curl | sh` installer.
+          if ! command -v wasm-pack >/dev/null 2>&1; then
+            cargo install wasm-pack --version 0.14.0 --locked
+          fi
+          wasm-pack --version
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      # The release this commit is (its `v*` tag, asked of origin: the shallow
+      # checkout fetched no tags), baked into the bundles by build-wasm.sh so
+      # the play page's netplay build id is that release's. An untagged commit
+      # builds a development bundle; release.yml re-dispatches this job with
+      # pages_only once a release publishes, so a tag pushed after this run
+      # still reaches the site.
+      - name: Release version of this commit
+        run: |
+          v="$(scripts/ci/release-version.sh --head --remote)"
+          echo "LEGAIA_RELEASE_VERSION=${v}" >> "$GITHUB_ENV"
+          echo "site release: ${v:-none (a development build)}"
+
+      # Both bundles, by the same script a local build runs: the play page loads
+      # site/wasm/play/, so a deploy that built only the tool bundle would publish a
+      # site whose play page cannot start.
+      - name: Build both WASM bundles
+        run: scripts/ci/build-wasm.sh
+
+      - name: Generate site pages
+        run: python3 site/_gen.py
+
+      # Refuses a missing artifact, a stale stamp or a non-shipped profile on either
+      # bundle, and a page that does not carry its bundle's version. The stamps are
+      # local build state, so they stop at this step and do not publish.
+      - name: Refuse a site missing a bundle
+        run: |
+          python3 scripts/ci/check-wasm-freshness.py --strict
+          grep -q 'LEGAIA_WASM_BUNDLE="play"' site/play.html
+          if grep -q 'LEGAIA_WASM_V="0"' site/play.html site/viewer.html; then
+            echo "a page carries no bundle version" >&2
+            exit 1
+          fi
+          rm -f site/wasm/SOURCE_STAMP.json site/wasm/play/SOURCE_STAMP.json
+
+      # A re-run of this job runs inside the same workflow run, where the
+      # earlier attempt's artifact still exists. With one fixed name the
+      # deploy step then finds two `github-pages` artifacts and refuses to
+      # choose, so each attempt uploads and deploys its own.
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: site/
+          name: github-pages-attempt-${{ github.run_attempt }}
+
+      # GitHub's side of a Pages deploy sometimes sits in `syncing_files`
+      # well past the action's status poll, which is capped at 10 minutes
+      # (a larger `timeout` is clamped to 600000 with a warning) and which
+      # cancels the deployment when it gives up. Nothing is wrong with the
+      # artifact in that case, so a fresh deployment of the same artifact
+      # after a short back-off normally goes through. Three attempts.
+      - name: Deploy to GitHub Pages
+        id: deploy1
+        continue-on-error: true
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+        with:
+          timeout: 600000
+          artifact_name: github-pages-attempt-${{ github.run_attempt }}
+
+      - name: Back off before retrying the deploy
+        if: steps.deploy1.outcome == 'failure'
+        run: |
+          echo "::warning::Pages deploy attempt 1 failed; retrying in 60 s"
+          sleep 60
+
+      - name: Deploy to GitHub Pages (retry 1)
+        id: deploy2
+        if: steps.deploy1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+        with:
+          timeout: 600000
+          artifact_name: github-pages-attempt-${{ github.run_attempt }}
+
+      - name: Back off before the last deploy attempt
+        if: steps.deploy1.outcome == 'failure' && steps.deploy2.outcome == 'failure'
+        run: |
+          echo "::warning::Pages deploy attempt 2 failed; last try in 120 s"
+          sleep 120
+
+      - name: Deploy to GitHub Pages (retry 2)
+        id: deploy3
+        if: steps.deploy1.outcome == 'failure' && steps.deploy2.outcome == 'failure'
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+        with:
+          timeout: 600000
+          artifact_name: github-pages-attempt-${{ github.run_attempt }}
+
+  # -- CI Summary -------------------------------------------------------------
+  notify:
+    name: CI Summary
+    needs: [gates, pr-lint, ci, deploy-pages, disc-test]
+    if: always()
+    runs-on: self-hosted
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Main CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Repo Gates | ${{ needs.gates.result == 'success' && 'pass' || needs.gates.result == 'skipped' && 'skipped' || 'FAIL' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Lint | ${{ needs.pr-lint.result == 'success' && 'pass' || needs.pr-lint.result == 'skipped' && 'skipped' || 'FAIL' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CI | ${{ needs.ci.result == 'success' && 'pass' || needs.ci.result == 'skipped' && 'skipped' || 'FAIL' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| GitHub Pages | ${{ needs.deploy-pages.result == 'success' && 'pass' || needs.deploy-pages.result == 'skipped' && 'skipped' || 'FAIL' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Disc Tests | ${{ needs.disc-test.result == 'success' && 'pass' || needs.disc-test.result == 'skipped' && 'skipped' || 'FAIL' }} |" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ needs.gates.result }}" == "failure" || "${{ needs.pr-lint.result }}" == "failure" || "${{ needs.ci.result }}" == "failure" || "${{ needs.disc-test.result }}" == "failure" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "CI failed - please review the logs" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
